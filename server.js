@@ -6,8 +6,6 @@ const compression = require('compression');
 const fetch = require('node-fetch');
 const { URL } = require('url');
 const crypto = require('crypto');
-const LRU = require('lru-cache');
-
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -27,6 +25,101 @@ const CONFIG = {
     ALLOWED_DOMAINS: process.env.ALLOWED_DOMAINS ? process.env.ALLOWED_DOMAINS.split(',') : null,
     MAX_CONCURRENT_REQUESTS: parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 100
 };
+
+// Simple in-memory cache implementation (no external dependencies)
+class SimpleCache {
+    constructor(maxSize = 500, ttl = 300000) {
+        this.cache = new Map();
+        this.maxSize = maxSize;
+        this.ttl = ttl;
+    }
+
+    set(key, value, customTtl = null) {
+        const expiry = Date.now() + (customTtl || this.ttl);
+
+        // Remove oldest entries if cache is full
+        if (this.cache.size >= this.maxSize) {
+            const firstKey = this.cache.keys().next().value;
+            this.cache.delete(firstKey);
+        }
+
+        this.cache.set(key, { value, expiry, timestamp: Date.now() });
+    }
+
+    get(key) {
+        const item = this.cache.get(key);
+        if (!item) return null;
+
+        if (Date.now() > item.expiry) {
+            this.cache.delete(key);
+            return null;
+        }
+
+        return item.value;
+    }
+
+    has(key) {
+        const item = this.cache.get(key);
+        if (!item) return false;
+
+        if (Date.now() > item.expiry) {
+            this.cache.delete(key);
+            return false;
+        }
+
+        return true;
+    }
+
+    delete(key) {
+        return this.cache.delete(key);
+    }
+
+    clear() {
+        this.cache.clear();
+    }
+
+    size() {
+        // Clean up expired items first
+        const now = Date.now();
+        for (const [key, item] of this.cache.entries()) {
+            if (now > item.expiry) {
+                this.cache.delete(key);
+            }
+        }
+        return this.cache.size;
+    }
+
+    keys() {
+        return Array.from(this.cache.keys());
+    }
+
+    // Get cache statistics
+    getStats() {
+        const now = Date.now();
+        let expired = 0;
+        let totalSize = 0;
+
+        for (const [key, item] of this.cache.entries()) {
+            if (now > item.expiry) {
+                expired++;
+            }
+
+            if (item.value && typeof item.value === 'object' && item.value.content) {
+                totalSize += Buffer.isBuffer(item.value.content) ?
+                    item.value.content.length :
+                    item.value.content.length * 2; // Rough string size estimate
+            }
+        }
+
+        return {
+            size: this.cache.size,
+            maxSize: this.maxSize,
+            expired,
+            totalSize,
+            ttl: this.ttl
+        };
+    }
+}
 
 // Security middleware
 app.use(helmet({
@@ -115,20 +208,9 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-// Advanced caching with LRU
-const playlistCache = new LRU({
-    max: CONFIG.MAX_CACHE_SIZE,
-    ttl: CONFIG.PLAYLIST_CACHE_TTL,
-    updateAgeOnGet: true,
-    allowStale: true
-});
-
-const segmentCache = new LRU({
-    max: CONFIG.MAX_CACHE_SIZE * 2,
-    ttl: CONFIG.CACHE_TTL,
-    updateAgeOnGet: true,
-    allowStale: true
-});
+// Initialize caches
+const playlistCache = new SimpleCache(CONFIG.MAX_CACHE_SIZE, CONFIG.PLAYLIST_CACHE_TTL);
+const segmentCache = new SimpleCache(CONFIG.MAX_CACHE_SIZE * 2, CONFIG.CACHE_TTL);
 
 // Request tracking for concurrent limit
 let activeRequests = 0;
@@ -336,12 +418,12 @@ app.get('/health', healthLimiter, (req, res) => {
         },
         cache: {
             playlists: {
-                size: playlistCache.size,
-                calculatedSize: playlistCache.calculatedSize
+                size: playlistCache.size(),
+                ...playlistCache.getStats()
             },
             segments: {
-                size: segmentCache.size,
-                calculatedSize: segmentCache.calculatedSize
+                size: segmentCache.size(),
+                ...segmentCache.getStats()
             }
         },
         system: {
@@ -554,16 +636,8 @@ app.get('/api/cache/clear', generalLimiter, (req, res) => {
 
 app.get('/api/cache/stats', generalLimiter, (req, res) => {
     res.json({
-        playlists: {
-            size: playlistCache.size,
-            calculatedSize: playlistCache.calculatedSize,
-            maxSize: playlistCache.max
-        },
-        segments: {
-            size: segmentCache.size,
-            calculatedSize: segmentCache.calculatedSize,
-            maxSize: segmentCache.max
-        },
+        playlists: playlistCache.getStats(),
+        segments: segmentCache.getStats(),
         failedHosts: Array.from(failedHosts.entries()).map(([host, data]) => ({
             host,
             failures: data.count,
