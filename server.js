@@ -24,7 +24,9 @@ const CONFIG = {
     BLOCKED_DOMAINS: process.env.BLOCKED_DOMAINS ? process.env.BLOCKED_DOMAINS.split(',') : ['localhost', '127.0.0.1', '0.0.0.0', '::1'],
     ALLOWED_DOMAINS: process.env.ALLOWED_DOMAINS ? process.env.ALLOWED_DOMAINS.split(',') : null,
     MAX_CONCURRENT_REQUESTS: parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 100,
-    MAX_CUSTOM_HEADERS: parseInt(process.env.MAX_CUSTOM_HEADERS) || 20 // Limit custom headers
+    MAX_CUSTOM_HEADERS: parseInt(process.env.MAX_CUSTOM_HEADERS) || 20, // Limit custom headers
+    DEFAULT_REFERER: process.env.DEFAULT_REFERER || null,
+    DEFAULT_ORIGIN: process.env.DEFAULT_ORIGIN || null
 };
 
 // Simple in-memory cache implementation (no external dependencies)
@@ -437,8 +439,24 @@ function generateRequestHeaders(originalHeaders = {}, url = '', customHeaders = 
         headers['Accept'] = 'video/*, */*';
     }
 
-    // Add referer from same domain
-    headers['Referer'] = `${urlObj.protocol}//${urlObj.hostname}/`;
+    // Set Referer/Origin defaults
+    if (CONFIG.DEFAULT_REFERER) {
+        headers['Referer'] = CONFIG.DEFAULT_REFERER;
+    } else {
+        headers['Referer'] = `${urlObj.protocol}//${urlObj.hostname}/`;
+    }
+
+    if (CONFIG.DEFAULT_ORIGIN) {
+        headers['Origin'] = CONFIG.DEFAULT_ORIGIN;
+    } else {
+        // Derive Origin from Referer or target URL
+        try {
+            const refUrl = new URL(headers['Referer']);
+            headers['Origin'] = `${refUrl.protocol}//${refUrl.host}`;
+        } catch (e) {
+            headers['Origin'] = `${urlObj.protocol}//${urlObj.host}`;
+        }
+    }
 
     // Forward important headers from original request
     if (originalHeaders.range) headers['Range'] = originalHeaders.range;
@@ -1220,5 +1238,4 @@ server.on('error', (error) => {
     }
     process.exit(1);
 });
-
 module.exports = app;
