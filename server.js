@@ -23,7 +23,8 @@ const CONFIG = {
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['*'],
     BLOCKED_DOMAINS: process.env.BLOCKED_DOMAINS ? process.env.BLOCKED_DOMAINS.split(',') : ['localhost', '127.0.0.1', '0.0.0.0', '::1'],
     ALLOWED_DOMAINS: process.env.ALLOWED_DOMAINS ? process.env.ALLOWED_DOMAINS.split(',') : null,
-    MAX_CONCURRENT_REQUESTS: parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 100
+    MAX_CONCURRENT_REQUESTS: parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 100,
+    MAX_CUSTOM_HEADERS: parseInt(process.env.MAX_CUSTOM_HEADERS) || 20 // Limit custom headers
 };
 
 // Simple in-memory cache implementation (no external dependencies)
@@ -187,7 +188,8 @@ const corsOptions = {
         'Origin',
         'X-Requested-With',
         'X-Forwarded-For',
-        'X-Real-IP'
+        'X-Real-IP',
+        'X-Custom-Headers' // Allow custom headers header
     ],
     exposedHeaders: [
         'Content-Length',
@@ -278,6 +280,126 @@ function validateUrl(urlString) {
     }
 }
 
+// Dangerous headers that should never be forwarded to prevent security issues
+const BLOCKED_HEADERS = new Set([
+    'host',
+    'connection',
+    'content-length',
+    'transfer-encoding',
+    'te',
+    'upgrade',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'www-authenticate',
+    'set-cookie',
+    'cookie'
+]);
+
+// Custom header validation and parsing
+function parseCustomHeaders(customHeadersParam, requestHeaders = {}) {
+    const customHeaders = {};
+    const errors = [];
+
+    try {
+        // Parse custom headers from different sources
+        let headerSources = [];
+
+        // 1. From query parameter (JSON string or base64 encoded)
+        if (customHeadersParam) {
+            try {
+                // Try to parse as JSON first
+                const parsed = JSON.parse(customHeadersParam);
+                headerSources.push({ source: 'query-json', headers: parsed });
+            } catch (jsonError) {
+                try {
+                    // Try to parse as base64 encoded JSON
+                    const decoded = Buffer.from(customHeadersParam, 'base64').toString('utf8');
+                    const parsed = JSON.parse(decoded);
+                    headerSources.push({ source: 'query-base64', headers: parsed });
+                } catch (base64Error) {
+                    errors.push('Invalid custom headers format. Use JSON or base64-encoded JSON.');
+                }
+            }
+        }
+
+        // 2. From X-Custom-Headers request header
+        if (requestHeaders['x-custom-headers']) {
+            try {
+                const parsed = JSON.parse(requestHeaders['x-custom-headers']);
+                headerSources.push({ source: 'header', headers: parsed });
+            } catch (error) {
+                errors.push('Invalid X-Custom-Headers format. Must be valid JSON.');
+            }
+        }
+
+        // 3. From individual X-Forward-* headers
+        Object.keys(requestHeaders).forEach(headerName => {
+            if (headerName.toLowerCase().startsWith('x-forward-')) {
+                const targetHeader = headerName.substring(10); // Remove 'x-forward-' prefix
+                if (targetHeader) {
+                    headerSources.push({
+                        source: 'x-forward',
+                        headers: { [targetHeader]: requestHeaders[headerName] }
+                    });
+                }
+            }
+        });
+
+        // Process all header sources
+        headerSources.forEach(({ source, headers }) => {
+            if (typeof headers !== 'object' || Array.isArray(headers)) {
+                errors.push(`Custom headers from ${source} must be an object`);
+                return;
+            }
+
+            Object.keys(headers).forEach(key => {
+                const normalizedKey = key.toLowerCase().trim();
+                const value = headers[key];
+
+                // Validation checks
+                if (!normalizedKey) {
+                    errors.push('Header name cannot be empty');
+                    return;
+                }
+
+                if (BLOCKED_HEADERS.has(normalizedKey)) {
+                    errors.push(`Header '${key}' is blocked for security reasons`);
+                    return;
+                }
+
+                if (typeof value !== 'string' && typeof value !== 'number') {
+                    errors.push(`Header '${key}' value must be string or number`);
+                    return;
+                }
+
+                // Length validation
+                if (normalizedKey.length > 100) {
+                    errors.push(`Header name '${key}' is too long (max 100 characters)`);
+                    return;
+                }
+
+                if (String(value).length > 2000) {
+                    errors.push(`Header '${key}' value is too long (max 2000 characters)`);
+                    return;
+                }
+
+                // Add to custom headers
+                customHeaders[key] = String(value);
+            });
+        });
+
+        // Check total custom headers limit
+        if (Object.keys(customHeaders).length > CONFIG.MAX_CUSTOM_HEADERS) {
+            errors.push(`Too many custom headers (max ${CONFIG.MAX_CUSTOM_HEADERS})`);
+        }
+
+    } catch (error) {
+        errors.push(`Error parsing custom headers: ${error.message}`);
+    }
+
+    return { customHeaders, errors };
+}
+
 // Enhanced user agent rotation with real browser signatures
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -289,8 +411,8 @@ const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0'
 ];
 
-// Smart header generation
-function generateRequestHeaders(originalHeaders = {}, url = '') {
+// Smart header generation with custom headers support
+function generateRequestHeaders(originalHeaders = {}, url = '', customHeaders = {}) {
     const userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
     const urlObj = new URL(url);
 
@@ -323,6 +445,15 @@ function generateRequestHeaders(originalHeaders = {}, url = '') {
     if (originalHeaders['if-range']) headers['If-Range'] = originalHeaders['if-range'];
     if (originalHeaders['if-none-match']) headers['If-None-Match'] = originalHeaders['if-none-match'];
     if (originalHeaders['if-modified-since']) headers['If-Modified-Since'] = originalHeaders['if-modified-since'];
+
+    // Apply custom headers (they override defaults)
+    Object.keys(customHeaders).forEach(key => {
+        const normalizedKey = key.toLowerCase();
+        // Don't override blocked headers
+        if (!BLOCKED_HEADERS.has(normalizedKey)) {
+            headers[key] = customHeaders[key];
+        }
+    });
 
     return headers;
 }
@@ -409,8 +540,9 @@ app.get('/health', healthLimiter, (req, res) => {
         status: 'OK',
         timestamp: new Date().toISOString(),
         uptime: Math.round(uptime),
-        version: '3.0.0',
+        version: '3.1.0',
         environment: CONFIG.NODE_ENV,
+        features: ['custom-headers', 'caching', 'rate-limiting', 'circuit-breaker'],
         memory: {
             used: Math.round(memUsage.heapUsed / 1024 / 1024),
             total: Math.round(memUsage.heapTotal / 1024 / 1024),
@@ -435,22 +567,29 @@ app.get('/health', healthLimiter, (req, res) => {
         limits: {
             maxConcurrentRequests: CONFIG.MAX_CONCURRENT_REQUESTS,
             rateLimit: CONFIG.RATE_LIMIT_MAX,
-            cacheSize: CONFIG.MAX_CACHE_SIZE
+            cacheSize: CONFIG.MAX_CACHE_SIZE,
+            maxCustomHeaders: CONFIG.MAX_CUSTOM_HEADERS
         }
     });
 });
 
-// Main HLS/Media proxy endpoint with NextJS optimization
+// Main HLS/Media proxy endpoint with custom headers support
 app.get('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
     const startTime = Date.now();
 
     try {
-        const { url, force_refresh, format } = req.query;
+        const { url, force_refresh, format, headers: customHeadersParam } = req.query;
 
         if (!url) {
             return res.status(400).json({
                 error: 'Missing required parameter: url',
-                example: '/api/proxy?url=https://example.com/playlist.m3u8'
+                example: '/api/proxy?url=https://example.com/playlist.m3u8',
+                customHeadersExamples: {
+                    queryParam: '/api/proxy?url=...&headers={"Authorization":"Bearer token","X-Custom":"value"}',
+                    base64: '/api/proxy?url=...&headers=' + Buffer.from('{"Authorization":"Bearer token"}').toString('base64'),
+                    requestHeader: 'X-Custom-Headers: {"Authorization":"Bearer token"}',
+                    forwardHeaders: 'X-Forward-Authorization: Bearer token'
+                }
             });
         }
 
@@ -463,8 +602,35 @@ app.get('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
             });
         }
 
+        // Parse custom headers
+        const { customHeaders, errors } = parseCustomHeaders(customHeadersParam, req.headers);
+
+        if (errors.length > 0) {
+            return res.status(400).json({
+                error: 'Custom headers validation failed',
+                details: errors,
+                customHeadersHelp: {
+                    formats: ['JSON string', 'Base64-encoded JSON', 'X-Custom-Headers request header', 'X-Forward-* headers'],
+                    blockedHeaders: Array.from(BLOCKED_HEADERS),
+                    limits: {
+                        maxHeaders: CONFIG.MAX_CUSTOM_HEADERS,
+                        maxNameLength: 100,
+                        maxValueLength: 2000
+                    }
+                }
+            });
+        }
+
         const targetUrl = validation.url.href;
-        const cacheKey = crypto.createHash('sha256').update(targetUrl).digest('hex').substring(0, 16);
+
+        // Include custom headers in cache key to avoid conflicts
+        const customHeadersString = Object.keys(customHeaders).length > 0
+            ? JSON.stringify(customHeaders)
+            : '';
+        const cacheKey = crypto.createHash('sha256')
+            .update(targetUrl + customHeadersString)
+            .digest('hex')
+            .substring(0, 16);
 
         // Determine content type
         const isPlaylist = targetUrl.includes('.m3u8') ||
@@ -476,8 +642,8 @@ app.get('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
             targetUrl.includes('.mp4') ||
             format === 'segment';
 
-        // Cache check (skip for force refresh)
-        if (!force_refresh) {
+        // Cache check (skip for force refresh or when custom headers are used)
+        if (!force_refresh && Object.keys(customHeaders).length === 0) {
             const cache = isPlaylist ? playlistCache : segmentCache;
             const cached = cache.get(cacheKey);
 
@@ -488,26 +654,35 @@ app.get('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
                 res.set({
                     ...cached.headers,
                     'X-Proxy-Cache': 'HIT',
-                    'X-Proxy-Time': '0ms'
+                    'X-Proxy-Time': '0ms',
+                    'X-Custom-Headers-Used': Object.keys(customHeaders).length > 0 ? 'true' : 'false'
                 });
 
                 return cached.isBuffer ? res.send(cached.content) : res.send(cached.content);
             }
         }
 
-        console.log(`Proxying ${isPlaylist ? 'playlist' : 'media'}: ${targetUrl.substring(0, 80)}...`);
+        const customHeadersInfo = Object.keys(customHeaders).length > 0
+            ? `with ${Object.keys(customHeaders).length} custom headers`
+            : '';
+
+        console.log(`Proxying ${isPlaylist ? 'playlist' : 'media'}: ${targetUrl.substring(0, 80)}... ${customHeadersInfo}`);
+
+        // Generate headers with custom headers included
+        const requestHeaders = generateRequestHeaders(req.headers, targetUrl, customHeaders);
 
         // Fetch with retry
         const response = await fetchWithRetry(targetUrl, {
             method: 'GET',
-            headers: generateRequestHeaders(req.headers, targetUrl)
+            headers: requestHeaders
         });
 
         if (!response.ok) {
             console.error(`Upstream error ${response.status} for: ${targetUrl}`);
             return res.status(response.status).json({
                 error: `Upstream server returned ${response.status}: ${response.statusText}`,
-                url: targetUrl.substring(0, 100)
+                url: targetUrl.substring(0, 100),
+                customHeadersUsed: Object.keys(customHeaders)
             });
         }
 
@@ -519,13 +694,19 @@ app.get('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
             'Content-Type': contentType,
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Range, Content-Type, Authorization',
-            'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, X-Proxy-Cache',
+            'Access-Control-Allow-Headers': 'Range, Content-Type, Authorization, X-Custom-Headers',
+            'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, X-Proxy-Cache, X-Custom-Headers-Used',
             'X-Proxy-Cache': 'MISS',
             'X-Proxy-Time': `${Date.now() - startTime}ms`,
+            'X-Custom-Headers-Used': Object.keys(customHeaders).length > 0 ? 'true' : 'false',
             'Cache-Control': isPlaylist ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600',
             'Vary': 'Origin'
         };
+
+        // Add debug info for custom headers in development
+        if (CONFIG.NODE_ENV === 'development' && Object.keys(customHeaders).length > 0) {
+            responseHeaders['X-Debug-Custom-Headers'] = JSON.stringify(Object.keys(customHeaders));
+        }
 
         // Forward range and content headers
         ['content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'].forEach(header => {
@@ -556,21 +737,29 @@ app.get('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
                         segmentUrl = baseUrl + segmentUrl;
                     }
 
-                    // Proxy through our endpoint with format hint
-                    const proxyUrl = `/api/proxy?url=${encodeURIComponent(segmentUrl)}&format=segment`;
+                    // Proxy through our endpoint with format hint and custom headers
+                    let proxyUrl = `/api/proxy?url=${encodeURIComponent(segmentUrl)}&format=segment`;
+
+                    // Pass along custom headers to segments if they exist
+                    if (customHeadersParam) {
+                        proxyUrl += `&headers=${encodeURIComponent(customHeadersParam)}`;
+                    }
+
                     return proxyUrl;
                 }
 
                 return line;
             }).join('\n');
 
-            // Cache processed playlist
-            playlistCache.set(cacheKey, {
-                content: modifiedContent,
-                headers: responseHeaders,
-                isBuffer: false,
-                timestamp: Date.now()
-            });
+            // Cache processed playlist (only if no custom headers)
+            if (Object.keys(customHeaders).length === 0) {
+                playlistCache.set(cacheKey, {
+                    content: modifiedContent,
+                    headers: responseHeaders,
+                    isBuffer: false,
+                    timestamp: Date.now()
+                });
+            }
 
             res.send(modifiedContent);
 
@@ -578,13 +767,15 @@ app.get('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
             // Handle media segments
             const buffer = await response.buffer();
 
-            // Cache segments
-            segmentCache.set(cacheKey, {
-                content: buffer,
-                headers: responseHeaders,
-                isBuffer: true,
-                timestamp: Date.now()
-            });
+            // Cache segments (only if no custom headers)
+            if (Object.keys(customHeaders).length === 0) {
+                segmentCache.set(cacheKey, {
+                    content: buffer,
+                    headers: responseHeaders,
+                    isBuffer: true,
+                    timestamp: Date.now()
+                });
+            }
 
             res.send(buffer);
         }
@@ -610,9 +801,283 @@ app.get('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
             code: error.code,
             duration: `${duration}ms`,
             url: req.query.url ? req.query.url.substring(0, 100) : 'unknown',
+            customHeadersUsed: req.query.headers ? 'true' : 'false',
             ...(CONFIG.NODE_ENV === 'development' && { details: error.message })
         });
     }
+});
+
+// POST endpoint for complex custom headers
+app.post('/api/proxy', concurrencyControl, proxyLimiter, async (req, res) => {
+    const startTime = Date.now();
+
+    try {
+        const { url, force_refresh, format } = req.query;
+        const { headers: customHeaders = {}, options = {} } = req.body;
+
+        if (!url) {
+            return res.status(400).json({
+                error: 'Missing required parameter: url',
+                example: {
+                    method: 'POST',
+                    url: '/api/proxy?url=https://example.com/playlist.m3u8',
+                    body: {
+                        headers: {
+                            'Authorization': 'Bearer your-token',
+                            'X-API-Key': 'your-api-key',
+                            'User-Agent': 'Custom User Agent'
+                        },
+                        options: {
+                            timeout: 30000,
+                            retries: 3
+                        }
+                    }
+                }
+            });
+        }
+
+        // URL validation
+        const validation = validateUrl(decodeURIComponent(url));
+        if (!validation.valid) {
+            return res.status(400).json({
+                error: validation.error,
+                url: url.substring(0, 100) + (url.length > 100 ? '...' : '')
+            });
+        }
+
+        // Validate custom headers from request body
+        const { customHeaders: validatedHeaders, errors } = parseCustomHeaders(JSON.stringify(customHeaders));
+
+        if (errors.length > 0) {
+            return res.status(400).json({
+                error: 'Custom headers validation failed',
+                details: errors,
+                blockedHeaders: Array.from(BLOCKED_HEADERS)
+            });
+        }
+
+        const targetUrl = validation.url.href;
+
+        // Include custom headers in cache key
+        const customHeadersString = Object.keys(validatedHeaders).length > 0
+            ? JSON.stringify(validatedHeaders)
+            : '';
+        const cacheKey = crypto.createHash('sha256')
+            .update(targetUrl + customHeadersString)
+            .digest('hex')
+            .substring(0, 16);
+
+        // Determine content type
+        const isPlaylist = targetUrl.includes('.m3u8') ||
+            targetUrl.includes('.m3u') ||
+            format === 'playlist';
+
+        console.log(`POST Proxying ${isPlaylist ? 'playlist' : 'media'}: ${targetUrl.substring(0, 80)}... with ${Object.keys(validatedHeaders).length} custom headers`);
+
+        // Generate headers with custom headers included
+        const requestHeaders = generateRequestHeaders(req.headers, targetUrl, validatedHeaders);
+
+        // Apply options
+        const fetchOptions = {
+            method: 'GET',
+            headers: requestHeaders
+        };
+
+        // Custom timeout from options
+        const customTimeout = options.timeout && typeof options.timeout === 'number' && options.timeout > 0
+            ? Math.min(options.timeout, 120000) // Max 2 minutes
+            : CONFIG.TIMEOUT;
+
+        const customRetries = options.retries && typeof options.retries === 'number' && options.retries >= 0
+            ? Math.min(options.retries, 10) // Max 10 retries
+            : CONFIG.MAX_RETRIES;
+
+        // Fetch with custom options
+        const response = await fetchWithRetry(targetUrl, fetchOptions, customRetries);
+
+        if (!response.ok) {
+            console.error(`Upstream error ${response.status} for: ${targetUrl}`);
+            return res.status(response.status).json({
+                error: `Upstream server returned ${response.status}: ${response.statusText}`,
+                url: targetUrl.substring(0, 100),
+                customHeadersUsed: Object.keys(validatedHeaders),
+                options: { timeout: customTimeout, retries: customRetries }
+            });
+        }
+
+        // Response headers
+        const contentType = response.headers.get('content-type') ||
+            (isPlaylist ? 'application/vnd.apple.mpegurl' : 'application/octet-stream');
+
+        const responseHeaders = {
+            'Content-Type': contentType,
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Range, Content-Type, Authorization, X-Custom-Headers',
+            'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, X-Proxy-Cache, X-Custom-Headers-Used',
+            'X-Proxy-Cache': 'MISS',
+            'X-Proxy-Time': `${Date.now() - startTime}ms`,
+            'X-Custom-Headers-Used': Object.keys(validatedHeaders).length > 0 ? 'true' : 'false',
+            'X-Request-Method': 'POST',
+            'Cache-Control': isPlaylist ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600',
+            'Vary': 'Origin'
+        };
+
+        // Forward important response headers
+        ['content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'].forEach(header => {
+            if (response.headers.get(header)) {
+                responseHeaders[header.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('-')] =
+                    response.headers.get(header);
+            }
+        });
+
+        res.set(responseHeaders);
+        res.status(response.status);
+
+        if (isPlaylist) {
+            // Process playlist files
+            const text = await response.text();
+            const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+
+            const modifiedContent = text.split('\n').map(line => {
+                if (line.startsWith('#') || line.trim() === '') {
+                    return line;
+                }
+
+                if (line.trim().length > 0) {
+                    let segmentUrl = line.trim();
+
+                    // Convert relative URLs to absolute
+                    if (!segmentUrl.startsWith('http')) {
+                        segmentUrl = baseUrl + segmentUrl;
+                    }
+
+                    // For POST requests, we need to pass headers via query param for segments
+                    // since segments will be requested via GET
+                    let proxyUrl = `/api/proxy?url=${encodeURIComponent(segmentUrl)}&format=segment`;
+
+                    if (Object.keys(validatedHeaders).length > 0) {
+                        const headersBase64 = Buffer.from(JSON.stringify(validatedHeaders)).toString('base64');
+                        proxyUrl += `&headers=${encodeURIComponent(headersBase64)}`;
+                    }
+
+                    return proxyUrl;
+                }
+
+                return line;
+            }).join('\n');
+
+            res.send(modifiedContent);
+
+        } else {
+            // Handle media segments
+            const buffer = await response.buffer();
+            res.send(buffer);
+        }
+
+    } catch (error) {
+        const duration = Date.now() - startTime;
+        console.error(`POST Proxy error after ${duration}ms:`, error.message);
+
+        const errorResponses = {
+            'ENOTFOUND': { status: 404, message: 'Host not found' },
+            'ETIMEDOUT': { status: 408, message: 'Request timeout' },
+            'ECONNREFUSED': { status: 503, message: 'Connection refused' },
+            'ECONNRESET': { status: 502, message: 'Connection reset' },
+            'EPROTO': { status: 502, message: 'Protocol error' },
+            'CERT_EXPIRED': { status: 502, message: 'SSL certificate expired' }
+        };
+
+        const errorInfo = errorResponses[error.code] || { status: 500, message: 'Internal server error' };
+
+        res.status(errorInfo.status).json({
+            error: errorInfo.message,
+            code: error.code,
+            duration: `${duration}ms`,
+            url: req.query.url ? req.query.url.substring(0, 100) : 'unknown',
+            method: 'POST',
+            ...(CONFIG.NODE_ENV === 'development' && { details: error.message })
+        });
+    }
+});
+
+// Custom headers documentation endpoint
+app.get('/api/headers/help', generalLimiter, (req, res) => {
+    res.json({
+        title: 'Custom Headers Documentation',
+        version: '3.1.0',
+        methods: {
+            GET: {
+                description: 'Pass custom headers via query parameters or request headers',
+                examples: {
+                    queryJson: {
+                        url: '/api/proxy?url=https://example.com/stream.m3u8&headers={"Authorization":"Bearer token","X-API-Key":"key123"}',
+                        description: 'JSON string in query parameter'
+                    },
+                    queryBase64: {
+                        url: '/api/proxy?url=https://example.com/stream.m3u8&headers=' + Buffer.from('{"Authorization":"Bearer token"}').toString('base64'),
+                        description: 'Base64-encoded JSON in query parameter'
+                    },
+                    requestHeader: {
+                        headers: {
+                            'X-Custom-Headers': '{"Authorization":"Bearer token","X-API-Key":"key123"}'
+                        },
+                        description: 'JSON in X-Custom-Headers request header'
+                    },
+                    forwardHeaders: {
+                        headers: {
+                            'X-Forward-Authorization': 'Bearer token',
+                            'X-Forward-X-API-Key': 'key123'
+                        },
+                        description: 'Individual headers with X-Forward- prefix'
+                    }
+                }
+            },
+            POST: {
+                description: 'Pass custom headers in request body for complex scenarios',
+                example: {
+                    url: '/api/proxy?url=https://example.com/stream.m3u8',
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: {
+                        headers: {
+                            'Authorization': 'Bearer your-token-here',
+                            'X-API-Key': 'your-api-key',
+                            'User-Agent': 'Custom User Agent/1.0',
+                            'Referer': 'https://custom-referer.com',
+                            'X-Session-ID': 'session123'
+                        },
+                        options: {
+                            timeout: 45000,
+                            retries: 5
+                        }
+                    }
+                }
+            }
+        },
+        security: {
+            blockedHeaders: Array.from(BLOCKED_HEADERS),
+            limits: {
+                maxHeaders: CONFIG.MAX_CUSTOM_HEADERS,
+                maxNameLength: 100,
+                maxValueLength: 2000
+            },
+            note: 'Blocked headers are filtered for security reasons'
+        },
+        caching: {
+            note: 'Requests with custom headers are not cached to avoid conflicts',
+            behavior: 'Each unique combination of URL + headers creates a separate cache entry'
+        },
+        tips: [
+            'Use Base64 encoding for complex header values with special characters',
+            'POST method is recommended for requests with many custom headers',
+            'Custom headers are passed to all segments when processing playlists',
+            'Headers are validated and sanitized before forwarding',
+            'Use X-Forward-* pattern for simple header forwarding'
+        ]
+    });
 });
 
 // Cache management endpoints
@@ -651,7 +1116,7 @@ app.options('*', (req, res) => {
     res.set({
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, HEAD',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Range, User-Agent, Referer, Origin, X-Requested-With',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Range, User-Agent, Referer, Origin, X-Requested-With, X-Custom-Headers, X-Forward-*',
         'Access-Control-Max-Age': '86400',
         'Cache-Control': 'public, max-age=86400'
     });
@@ -663,7 +1128,9 @@ if (CONFIG.NODE_ENV === 'development') {
     app.use((req, res, next) => {
         const start = Date.now();
         res.on('finish', () => {
-            console.log(`${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms`);
+            const customHeaders = req.query.headers || req.headers['x-custom-headers'] ||
+            Object.keys(req.headers).filter(h => h.startsWith('x-forward-')).length > 0 ? 'YES' : 'NO';
+            console.log(`${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms [Custom Headers: ${customHeaders}]`);
         });
         next();
     });
@@ -689,7 +1156,13 @@ app.use((req, res) => {
     res.status(404).json({
         error: 'Endpoint not found',
         path: req.path,
-        availableEndpoints: ['/health', '/api/proxy', '/api/cache/clear', '/api/cache/stats']
+        availableEndpoints: [
+            '/health',
+            '/api/proxy (GET/POST)',
+            '/api/headers/help',
+            '/api/cache/clear',
+            '/api/cache/stats'
+        ]
     });
 });
 
@@ -717,14 +1190,22 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 const server = app.listen(PORT, () => {
-    console.log(`🚀 Production HLS Proxy Server v3.0.0`);
+    console.log(`🚀 Enhanced HLS Proxy Server v3.1.0 with Custom Headers`);
     console.log(`📡 Port: ${PORT}`);
     console.log(`🌍 Environment: ${CONFIG.NODE_ENV}`);
     console.log(`📊 Health: http://localhost:${PORT}/health`);
     console.log(`🎥 Proxy: http://localhost:${PORT}/api/proxy?url=YOUR_URL`);
+    console.log(`📝 Headers Help: http://localhost:${PORT}/api/headers/help`);
     console.log(`🗑️  Cache: http://localhost:${PORT}/api/cache/clear`);
     console.log(`⚡ Max concurrent requests: ${CONFIG.MAX_CONCURRENT_REQUESTS}`);
     console.log(`🔒 Rate limits: ${CONFIG.RATE_LIMIT_MAX}/15min, ${CONFIG.STRICT_RATE_LIMIT_MAX}/min`);
+    console.log(`🎛️  Max custom headers: ${CONFIG.MAX_CUSTOM_HEADERS}`);
+
+    console.log(`\n📋 Custom Headers Examples:`);
+    console.log(`   GET: /api/proxy?url=...&headers={"Authorization":"Bearer token"}`);
+    console.log(`   POST: Body with headers object and options`);
+    console.log(`   Header: X-Custom-Headers: {"key":"value"}`);
+    console.log(`   Forward: X-Forward-Authorization: Bearer token\n`);
 
     if (CONFIG.ALLOWED_DOMAINS) {
         console.log(`🛡️  Allowed domains: ${CONFIG.ALLOWED_DOMAINS.join(', ')}`);
