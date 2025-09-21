@@ -1,0 +1,55 @@
+{
+  "name": "hls-proxy",
+  "version": "3.0.0",
+  "description": "HLS proxy server with advanced caching, rate limiting, and NextJS integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "build": "echo 'No build step required'",
+    "test": "jest",
+    "lint": "eslint .",
+    "health": "curl -f http://localhost:3001/health || exit 1",
+    "docker:build": "docker build -t hls-proxy .",
+    "docker:run": "docker run -p 3001:3001 hls-proxy"
+  },
+  "keywords": [
+    "hls",
+    "proxy",
+    "streaming",
+    "video",
+    "nextjs",
+    "cors",
+    "cache"
+  ],
+  "author": "Maddev",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  },
+  "dependencies": {
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.2.0",
+    "lru-cache": "^10.4.3",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.4",
+    "eslint": "^8.55.0",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.2",
+    "supertest": "^6.3.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/roywalk3r/proxyG"
+  },
+  "bugs": {
+    "url": "https://github.com/roywalk3r/proxyG/issues"
+  },
+  "homepage": "https://github.com/roywalk3r/proxyG#readme"
+}
